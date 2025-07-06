@@ -58,7 +58,7 @@ The project uses the following files from the [UNSW-NB15 dataset](https://www.un
 ### 1. Clone the repository
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/pathupally/Distributed-Intrusion-Detection-Model
 cd UNSW-NB15
 ```
 
