@@ -34,7 +34,7 @@ The project uses the following files from the [UNSW-NB15 dataset](https://www.un
 - `NUSW-NB15_features.csv` (feature descriptions)
 - `UNSW-NB15_LIST_EVENTS.csv` (event list)
 
-**Note:** The data directory should contain all the above files for full training.
+**Note:** You must manually download the dataset from Kaggle and place all required files in the `data/` directory. See the Installation section below.
 
 ---
 
@@ -72,13 +72,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 3. Download the dataset from Kaggle
+
+Go to the [Kaggle dataset page](https://www.kaggle.com/datasets/mrwellsdavid/unsw-nb15), download the dataset files, and place all required CSV files in the `data/` directory of this project.
+
 ---
 
 ## Usage
 
 ### 1. Prepare the data
 
-Ensure all required CSV files are in the `data/` directory.
+Ensure all required CSV files are in the `data/` directory. If not, download them from Kaggle as described above.
 
 ### 2. Train and evaluate the model
 
@@ -131,6 +135,7 @@ docker run --rm -v $(pwd)/data:/app/data unsw-nb15-cyber
 ## References
 
 - [UNSW-NB15 Dataset](https://www.unsw.adfa.edu.au/unsw-canberra-cyber/cybersecurity/ADFA-NB15-Datasets/)
+- [Kaggle Dataset: mrwellsdavid/unsw-nb15](https://www.kaggle.com/datasets/mrwellsdavid/unsw-nb15)
 - [PyTorch Documentation](https://pytorch.org/)
 - [scikit-learn Documentation](https://scikit-learn.org/)
 
