@@ -1,199 +1,206 @@
-import os
 import pandas as pd
-import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from numpy.typing import NDArray
+from torch.utils.data import DataLoader, TensorDataset
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
-import argparse
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-"""
-How to run this script:
+def load_data():
+    # Load training dataset with headers
+    data = pd.read_csv('data/UNSW_NB15_training-set.csv') # Load dataset
+    
+    # Get column names from training data
+    column_names = data.columns.tolist()
+    
+    # List of additional CSV files to load
+    additional_files = [
+        'data/UNSW-NB15_1.csv',
+        'data/UNSW-NB15_2.csv', 
+        'data/UNSW-NB15_3.csv',
+        'data/UNSW-NB15_4.csv',
+    ]
+    
+    # Load and append additional CSV files
+    for file_path in additional_files:
+        try:
+            additional_data = pd.read_csv(file_path, header=None, names=column_names)
+            data = pd.concat([data, additional_data], ignore_index=True)
+            print(f"Loaded {file_path} - Total rows: {len(data)}")
+        except FileNotFoundError:
+            print(f"Warning: {file_path} not found, skipping...")
+    
+    
+    # Handle missing values
+    data = data.fillna('unknown')
+    
+    # Find all non-numeric columns (except label and attack_cat)
+    labels = data['label'].values # Extract labels first
+    features = data.drop(columns=['label', 'attack_cat'], axis=1) # Extract features
+    
+    # Identify categorical columns automatically
+    categorical_columns = []
+    for col in features.columns:
+        if features[col].dtype == 'object' or features[col].dtype == 'string':
+            categorical_columns.append(col)
+    
+    print(f"Found categorical columns: {categorical_columns}")
+    
+    # Use LabelEncoder for all categorical columns
+    label_encoders = {}
+    
+    for col in categorical_columns:
+        le = LabelEncoder()
+        features[col] = le.fit_transform(features[col].astype(str))
+        label_encoders[col] = le
+        print(f"Encoded {col}: {len(le.classes_)} unique values")
+    
+    # Convert all remaining columns to numeric, coercing errors to NaN
+    for col in features.columns:
+        if col not in categorical_columns:
+            features[col] = pd.to_numeric(features[col], errors='coerce')
+    
+    # Fill any remaining NaN values with 0
+    features = features.fillna(0)
+    
+    print(f"Final feature shape: {features.shape}")
+    print(f"Feature data types: {features.dtypes.value_counts()}")
+    
+    return features, labels
 
-Basic (single process):
-    python3 train.py --epochs 10 --batch_size 64
+def pre_processing(features, labels):
+    ''' Training and Testing Data '''
+    X_train, X_test, Y_train, Y_test = train_test_split(features, labels, test_size=0.2, random_state=42, stratify=labels) # Split data into training and testing sets
+    scaler = StandardScaler() # Initialize scaler
+    X_train = scaler.fit_transform(X_train) # Fit and transform training data
+    X_test = scaler.transform(X_test) # Transform testing data
+    
+    return X_train, X_test, Y_train, Y_test
 
-Distributed (multi-CPU/node, e.g. on Oracle Cloud):
-    torchrun --nproc_per_node=NUM_PROCESSES train.py --epochs 10 --batch_size 64
+def data_loader(X_train, X_test, Y_train, Y_test):
+    # 6. Convert NumPy arrays to PyTorch tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(Y_train, dtype=torch.float32)
+    X_test_tensor  = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor  = torch.tensor(Y_test, dtype=torch.float32)
 
-Arguments:
-    --data_dir      Path to the data directory (default: 'data')
-    --epochs        Number of training epochs (default: 10)
-    --batch_size    Batch size for training (default: 64)
-    --lr            Learning rate (default: 0.001)
-    --local_rank    (Set automatically by torchrun for distributed training)
-    --world_size    (Set automatically by torchrun for distributed training)
+    # 7. Create TensorDataset for convenient data handling
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset  = TensorDataset(X_test_tensor, y_test_tensor)
 
-Example for 4 CPUs:
-    torchrun --nproc_per_node=4 train.py --epochs 20 --batch_size 128
+    # 8. Use DataLoader to batch and shuffle the data
+    batch_size = 64  # industry-standard batch sizes are powers of 2 (32, 64, 128, etc.)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, test_loader, train_dataset, test_dataset
 
-"""
-
-
-
-def load_data(data_dir, columns=None):
-
-    data = pd.read_csv(os.path.join(data_dir, 'UNSW_NB15_training-set.csv'))
-    if columns is None:
-        columns = data.columns
-
-    acceptable = ['1.csv', '2.csv', '3.csv', '4.csv']
-    for filename in os.listdir(data_dir):
-        if any(filename.endswith(suffix) for suffix in acceptable):
-            file_path = os.path.join(data_dir, filename)
-            df = pd.read_csv(file_path, header=0, names=columns, skiprows=1, low_memory=False)
-            data = pd.concat([data, df], ignore_index=True)
-    return data
-
-def preprocess_data(data):
-    data = data.drop(['attack_cat', 'service', 'id'], axis=1, errors='ignore')
-
-    data = data.dropna(axis=0, thresh=int(data.shape[1] * 0.80))
-
-    labels = data['label'].values.astype(np.float32)
-    features = data.drop(columns=['label'], axis=1)
-
-    categorical_columns = ['proto', 'state']
-    encoder = OneHotEncoder(sparse=False)
-    cat_data = encoder.fit_transform(features[categorical_columns])
-
-    num_data = features.drop(columns=categorical_columns).values.astype(np.float32)
-
-    from scipy import sparse
-    X = sparse.hstack([num_data, cat_data]).tocsr()
-    return X, labels, encoder
-
-def create_dataloaders(X, y, batch_size, is_distributed, rank=0, world_size=1):
-
-    X = torch.tensor(X.todense(), dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.float32)
-    dataset = TensorDataset(X, y)
-    if is_distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    else:
-        sampler = None
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler)
-    return loader, sampler
-
+# 9. Define the neural network architecture
 class Net(nn.Module):
     def __init__(self, input_size):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(input_size, 64)
-        self.fc2 = nn.Linear(64, 1)
+        # Define layers:
+        self.fc1 = nn.Linear(input_size, 64)   # fully connected layer 1: input -> 64 hidden units
+        self.fc2 = nn.Linear(64, 1)           # fully connected layer 2: 64 -> 1 output
+    
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        # Define the forward pass (how data moves through the network)
+        x = F.relu(self.fc1(x))   # apply ReLU activation after first layer
+        x = self.fc2(x)           # second layer (output logits)
         return x
 
-def train(model, loader, criterion, optimizer, device, epoch, sampler=None):
-    model.train()
-    running_loss = 0.0
-    if sampler is not None:
-        sampler.set_epoch(epoch)
-    for batch_X, batch_Y in loader:
-        batch_X = batch_X.to(device)
-        batch_Y = batch_Y.to(device)
-        outputs = model(batch_X).view(-1)
-        loss = criterion(outputs, batch_Y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * batch_X.size(0)
-    epoch_loss = running_loss / len(loader.dataset)
-    print(f"Epoch [{epoch+1}], Loss: {epoch_loss:.4f}")
-    return epoch_loss
+def train_model(train_loader, train_dataset, input_dim):
+    # 10. Initialize the model
+    model = Net(input_dim)
+    print(model)
 
-def evaluate(model, loader, device):
+    device = torch.device('cpu')
+    model.to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr= 0.001)
+
+    num_epochs = 100
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0
+        
+        for batch_X, batch_Y in train_loader:
+            batch_X = batch_X.to(device)
+            batch_Y = batch_Y.to(device)
+            
+            outputs = model(batch_X)
+            outputs = outputs.view(-1)
+            
+            loss = criterion(outputs, batch_Y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * batch_X.size(0)
+            
+        epoch_loss = running_loss / len(train_dataset)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+    
+    return model
+
+def evaluate_model(model, test_loader):
+    device = torch.device('cpu')
     model.eval()
+
     correct = 0
     total = 0
     TP = FP = FN = 0
+
     with torch.no_grad():
-        for batch_X, batch_Y in loader:
+        for batch_X, batch_Y in test_loader:
             batch_X = batch_X.to(device)
             batch_Y = batch_Y.to(device)
+            
             outputs = model(batch_X)
+            
             probs = torch.sigmoid(outputs)
-            preds = (probs >= 0.5).float().view(-1)
+            preds = (probs >= 0.5).float()
+            # Flatten predictions and labels to 1D
+            preds = preds.view(-1)
             labels = batch_Y.view(-1)
+            # Count correct predictions
             correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            total   += labels.size(0)
+            
             TP += ((preds == 1) & (labels == 1)).sum().item()
             FP += ((preds == 1) & (labels == 0)).sum().item()
             FN += ((preds == 0) & (labels == 1)).sum().item()
+
     accuracy = correct / total
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
     print(f"Test Accuracy: {accuracy*100:.2f}%")
     print(f"Precision: {precision*100:.2f}%")
     print(f"Recall: {recall*100:.2f}%")
     print(f"F1 Score: {f1_score*100:.2f}%")
-    return accuracy, precision, recall, f1_score
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='data')
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--local_rank', type=int, default=0)
-    parser.add_argument('--world_size', type=int, default=1)
-    args = parser.parse_args()
-
-    is_distributed = 'RANK' in os.environ or args.world_size > 1
-    rank = int(os.environ.get('RANK', args.local_rank))
-    world_size = int(os.environ.get('WORLD_SIZE', args.world_size))
-
-    if is_distributed:
-        torch.distributed.init_process_group(backend='gloo')
-    device = torch.device('cpu')
-
-    # Only rank 0 prints
-    def log(*a, **kw):
-        if rank == 0:
-            print(*a, **kw)
-
-    log('Loading data...')
-    data = load_data(args.data_dir)
-    log('Preprocessing data...')
-    X, y, encoder = preprocess_data(data)
-    log(f'Feature shape: {X.shape}, Labels: {y.shape}')
-
-    # Train/test split
-    from sklearn.model_selection import train_test_split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    # Standardize numerical features (only on dense part)
-    scaler = StandardScaler()
-    X_train_dense = scaler.fit_transform(X_train[:, :X.shape[1] - encoder.categories_[0].size - encoder.categories_[1].size])
-    X_test_dense = scaler.transform(X_test[:, :X.shape[1] - encoder.categories_[0].size - encoder.categories_[1].size])
-    # Recombine with sparse one-hot
-    from scipy import sparse
-    X_train = sparse.hstack([X_train_dense, X_train[:, X.shape[1] - encoder.categories_[0].size - encoder.categories_[1].size:]]).tocsr()
-    X_test = sparse.hstack([X_test_dense, X_test[:, X.shape[1] - encoder.categories_[0].size - encoder.categories_[1].size:]]).tocsr()
-
-    train_loader, train_sampler = create_dataloaders(X_train, y_train, args.batch_size, is_distributed, rank, world_size)
-    test_loader, _ = create_dataloaders(X_test, y_test, args.batch_size, False)
-
+    # Load and preprocess data
+    features, labels = load_data()
+    X_train, X_test, Y_train, Y_test = pre_processing(features, labels)
+    
+    # Create data loaders
+    train_loader, test_loader, train_dataset, test_dataset = data_loader(X_train, X_test, Y_train, Y_test)
+    
+    # Get input dimension
     input_dim = X_train.shape[1]
-    model = Net(input_dim).to(device)
-    if is_distributed:
-        model = DDP(model)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Train the model
+    model = train_model(train_loader, train_dataset, input_dim)
+    
+    # Evaluate the model
+    evaluate_model(model, test_loader)
 
-    for epoch in range(args.epochs):
-        train(model, train_loader, criterion, optimizer, device, epoch, train_sampler)
-        if rank == 0:
-            evaluate(model, test_loader, device)
-
-    if rank == 0:
-        torch.save(model.state_dict(), 'model.pth')
-        log('Model saved to model.pth')
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
